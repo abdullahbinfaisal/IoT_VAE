@@ -201,10 +201,31 @@ def train(last_step, lmbdas):
             tf.summary.histogram("hist_y_%d" % i, y[i])
 
         tf.summary.scalar("total_loss", total_train_loss)
-
+ 
+        # Add step to logging
+        step = tf.train.get_global_step()
+        # Configure logging hook
+        tensors_to_log = {
+            'step': step,
+            'total_loss': total_train_loss
+        }
+        for i in range(len(args.switch_list)):
+            tensors_to_log[f'loss_{i}'] = train_loss[i]
+            tensors_to_log[f'bpp_{i}'] = train_bpp[i]
+            tensors_to_log[f'mse_{i}'] = train_mse[i] * 255 ** 2  # Match summary scale
+            
+        logging_hook = tf.train.LoggingTensorHook(
+            tensors=tensors_to_log,
+            every_n_iter=10,
+            formatter=lambda d: f"Step {int(d['step'])} | Total: {d['total_loss']:.3f} | " + 
+                " | ".join([f"L{i}: {d[f'loss_{i}']:.3f}" for i in range(len(args.switch_list))])
+        )
+        
         hooks = [
             tf.train.StopAtStepHook(last_step=last_step),
             tf.train.NanTensorHook(total_train_loss),
+            logging_hook,
+        
         ]
 
         with tf.train.MonitoredTrainingSession(
