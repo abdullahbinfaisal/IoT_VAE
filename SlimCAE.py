@@ -201,143 +201,101 @@ class SlimCAE(tf.keras.Model):
         return x_tilde, y, y_tilde, likelihoods
 
 
+
 def train(last_step, lmbdas):
-    """Trains the model."""
-    
-    # Set logging level for TensorFlow 2.x
+    """Trains the model with an optimized data pipeline and graph-compiled training step."""
+    # Set logging level
     logger = tf.get_logger()
     logger.setLevel('INFO')
-    
-    # Create input data pipeline
-    train_files = glob.glob(args.train_glob)
-    train_dataset = tf.data.Dataset.from_tensor_slices(train_files)
-    train_dataset = train_dataset.shuffle(buffer_size=len(train_files)).repeat()
-    train_dataset = train_dataset.map(load_image, num_parallel_calls=args.preprocess_threads)
 
+    # Build input pipeline
+    AUTOTUNE = tf.data.AUTOTUNE
     def preprocess(x):
         shape = tf.shape(x)[:2]
         ps = args.patchsize
-        # if both H and W ≥ ps, do random crop, else resize to (ps,ps)
         return tf.cond(
             tf.reduce_all(shape >= [ps, ps]),
             lambda: tf.image.random_crop(x, [ps, ps, 3]),
-            lambda: tf.image.resize(x, [ps, ps]),
+            lambda: tf.image.resize(x, [ps, ps])
         )
 
-
-    train_dataset = train_dataset.map(
-        preprocess, num_parallel_calls=args.preprocess_threads
+    train_dataset = (
+        tf.data.Dataset
+          .list_files(args.train_glob, shuffle=True)
+          .shuffle(buffer_size=len(glob.glob(args.train_glob)))
+          .repeat()
+          .interleave(
+              lambda f: tf.data.Dataset.from_tensors(f)
+                        .map(load_image, num_parallel_calls=AUTOTUNE),
+              cycle_length=args.preprocess_threads,
+              num_parallel_calls=AUTOTUNE
+          )
+          .map(preprocess, num_parallel_calls=AUTOTUNE)
+          .batch(args.batchsize, drop_remainder=True)
+          .prefetch(AUTOTUNE)
     )
 
-
-    train_dataset = train_dataset.batch(args.batchsize)
-    train_dataset = train_dataset.prefetch(32)
-
     num_pixels = args.batchsize * args.patchsize ** 2
-    total_filters_num = args.num_filters
+    model = SlimCAE(args.switch_list, args.num_filters)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
 
-    # Create model
-    model = SlimCAE(args.switch_list, total_filters_num)
-    
-    # Optimizer
-    main_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
-    
-    # Define train step function with proper gradient computation
+    @tf.function
     def train_step(x):
         with tf.GradientTape() as tape:
-            # Forward pass
-            x_tilde, y, y_tilde, likelihoods = model(x, training=True)
-            
-            # Calculate losses for each switch
-            train_loss_values = []
-            train_bpp_values = []
-            train_mse_values = []
-            
-            for i, _switch in enumerate(args.switch_list):
-                # Calculate bits per pixel (bpp)
-                train_bpp = tf.reduce_sum(tf.math.log(likelihoods[i])) / (-np.log(2) * num_pixels)
-                train_bpp_values.append(train_bpp)
-                
-                # Calculate mean squared error
-                train_mse = tf.reduce_mean(tf.square(x - x_tilde[i]))
-                train_mse_values.append(train_mse)
-                
-                # Combined RD loss
-                train_loss = lmbdas[i] * train_mse + train_bpp
-                train_loss_values.append(train_loss)
-            
-            # Total loss
-            total_loss = tf.add_n(train_loss_values)
-        
-        # Compute gradients and update model
-        # variables = model.trainable_variables
-        # gradients = tape.gradient(total_loss, variables)
-        # # 2) Inspect per‐variable
-        # for var, grad in zip(model.trainable_variables, gradients):
-        #     # Check if gradient exists (None means no path)
-        #     exists = grad is not None  
-        #     # Compute norm (will error if grad is None)
-        #     norm = tf.norm(grad).numpy() if exists else None
-        #     print(f"{var.name:40s} | exists={exists} | norm={norm}")
-        variables = model.trainable_variables
-        grads     = tape.gradient(total_loss, variables)
-        grads_and_vars = [(g, v)
-                          for g, v in zip(grads, variables)
-                          if g is not None]
-        main_optimizer.apply_gradients(grads_and_vars)
-        
-        return total_loss, train_loss_values, train_bpp_values, train_mse_values, y
-    
-    # TensorBoard setup
+            x_tildes, ys, y_tildes, likelihoods = model(x, training=True)
+            losses, bpps, mses = [], [], []
+            for i in range(len(args.switch_list)):
+                bpp = tf.reduce_sum(tf.math.log(likelihoods[i])) / (-np.log(2) * num_pixels)
+                mse = tf.reduce_mean(tf.square(x - x_tildes[i]))
+                loss = lmbdas[i] * mse + bpp
+                losses.append(loss)
+                bpps.append(bpp)
+                mses.append(mse)
+            total_loss = tf.add_n(losses)
+        grads = tape.gradient(total_loss, model.trainable_variables)
+        grads_and_vars = [(g, v) for g, v in zip(grads, model.trainable_variables) if g is not None]
+        optimizer.apply_gradients(grads_and_vars)
+        return total_loss, losses, bpps, mses, ys
+
+    # TensorBoard and checkpoint setup
     log_dir = os.path.join(args.checkpoint_dir, "logs")
     summary_writer = tf.summary.create_file_writer(log_dir)
-    
-    # Checkpoint setup
-    checkpoint = tf.train.Checkpoint(model=model, optimizer=main_optimizer)
-    manager = tf.train.CheckpointManager(
-        checkpoint, args.checkpoint_dir, max_to_keep=5)
-    
-    # Restore from latest checkpoint if available
-    latest_checkpoint = manager.latest_checkpoint
-    if latest_checkpoint:
-        checkpoint.restore(latest_checkpoint)
-        print(f"Restored from {latest_checkpoint}")
-        step = int(latest_checkpoint.split('-')[-1])
+    ckpt = tf.train.Checkpoint(model=model, optimizer=optimizer)
+    manager = tf.train.CheckpointManager(ckpt, args.checkpoint_dir, max_to_keep=5)
+
+    # Restore from latest checkpoint
+    latest = manager.latest_checkpoint
+    if latest:
+        ckpt.restore(latest)
+        print(f"Restored from {latest}")
+        step = int(latest.split('-')[-1])
     else:
         step = 0
-    
+
     # Training loop
     while step < last_step:
         for batch in train_dataset:
-            loss, train_losses, bpps, mses, y_values = train_step(batch)
-            
-            # Log progress
+            loss, losses, bpps, mses, ys = train_step(batch)
             if step % 1 == 0:
                 print(f"Step: {step}, Loss: {loss.numpy():.6f}")
-                
                 with summary_writer.as_default():
                     tf.summary.scalar("total_loss", loss, step=step)
-                    for i, _switch in enumerate(args.switch_list):
-                        tf.summary.scalar(f"loss_{i}", train_losses[i], step=step)
+                    for i in range(len(losses)):
+                        tf.summary.scalar(f"loss_{i}", losses[i], step=step)
                         tf.summary.scalar(f"bpp_{i}", bpps[i], step=step)
                         tf.summary.scalar(f"mse_{i}", mses[i] * 255**2, step=step)
-                        tf.summary.histogram(f"hist_y_{i}", y_values[i], step=step)
-            
-            # Save checkpoint
+                        tf.summary.histogram(f"hist_y_{i}", ys[i], step=step)
             if step % 1000 == 0:
                 save_path = manager.save(checkpoint_number=step)
                 print(f"Checkpoint saved: {save_path}")
-            
             step += 1
             if step >= last_step:
                 break
-                
-    # Save final model
+
+    # Final checkpoint
     save_path = manager.save(checkpoint_number=step)
     print(f"Final checkpoint saved: {save_path}")
-    
     return model
-
 
 def evaluate(last_step):
     """Evaluate the model for test dataset"""
