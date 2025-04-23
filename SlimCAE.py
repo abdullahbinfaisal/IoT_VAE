@@ -2,358 +2,472 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-
 import argparse
 import glob
-from os import listdir
 import os
-import scipy.io
 import csv
 import numpy as np
 import tensorflow as tf
 import tensorflow_compression as tfc
-import sys 
+from tensorflow_compression_2.signal_conv_slim import SignalConv2D_slim
+from tensorflow_compression_2.gdn_slim_plus import GDN
+EntropyModelClass = tfc.entropy_models.PowerLawEntropyModel
 
 
 def load_image(filename):
-    """Loads a PNG image file."""
-    string = tf.read_file(filename)
-    image = tf.image.decode_image(string, channels=3)
-    image = tf.cast(image, tf.float32)
-    image /= 255
+    """Loads a JPEG image file."""
+    string = tf.io.read_file(filename)
+    image = tf.image.decode_jpeg(string, channels=3)
+    # tell TF it’s a 3‑D tensor [H, W, 3]
+    image.set_shape([None, None, 3])
+    image = tf.cast(image, tf.float32) / 255.0
     return image
+
 
 def quantize_image(image):
-    image = tf.clip_by_value(image, 0, 1)
-    image = tf.round(image * 255)
-    image = tf.cast(image, tf.uint8)
+    image = tf.clip_by_value(image, 0, 1)  # Ensure the image values are between 0 and 1
+    image = tf.round(image * 255)           # Quantize to the range [0, 255]
+    image = tf.cast(image, tf.uint8)        # Cast to uint8 for 8-bit representation
     return image
 
+
 def save_image(filename, image):
-    """Saves an image to a PNG file."""
-    image = quantize_image(image)
-    string = tf.image.encode_png(image)
-    return tf.write_file(filename, string)
+    """Saves an image to a JPEG file."""
+    image = quantize_image(image)           # 0–255 uint8
+    string = tf.image.encode_jpeg(image)    # JPEG instead of PNG
+    return tf.io.write_file(filename, string)
 
-# slimmable autoencoder -- encoder
-def slimmable_analysis_transform(tensor_in, switch_list, total_filters_num): 
-    """Builds the slimmable analysis transform."""
-    with tf.variable_scope("analysis"):
-        tensor_encoder = list()
-        for i, _switch in enumerate(switch_list):
-            # the first conv and switchable gdn layers
-            with tf.variable_scope("layer_0",reuse=(i>0)):
-                layer = tfc.SignalConv2D_slim(
-                    total_filters_num, (9, 9), corr=True, strides_down=4, padding="same_zeros",
-                    use_bias=True, activation=None)
-                tensor = layer(tensor_in, 3, _switch)
 
-            with tf.variable_scope("gdn_an_0_{:1d}".format(i)):
-                tensor_gdn_0 = tfc.GDN()(tensor)
-            tensor_gdn_0 = tf.pad(tensor_gdn_0, [[0,0], [0,0], [0,0], [0,(total_filters_num - _switch)]], "CONSTANT")
-
-            # the second conv and switchable gdn layers
-            with tf.variable_scope("layer_1",reuse=(i>0)):
-                layer = tfc.SignalConv2D_slim(
-                    total_filters_num, (5, 5), corr=True, strides_down=2, padding="same_zeros",
-                    use_bias=True, activation=None)
-                tensor = layer(tensor_gdn_0, _switch, _switch)
+# Create a proper Keras model
+class SlimCAE(tf.keras.Model):
+    def __init__(self, switch_list, total_filters_num):
+        super(SlimCAE, self).__init__()
+        self.switch_list = switch_list
+        self.total_filters_num = total_filters_num
+        self.entropy_models = [
+            EntropyModelClass(coding_rank=2) for _ in switch_list
+        ]
+        
+        # Initialize analysis (encoder) layers
+        self.analysis_conv_layers = []
+        self.analysis_gdn_layers = []
+        
+        for i in range(len(switch_list)):
+            # Convolutional layers - 3 per switch
+            layer_set = []
+            layer_set.append(SignalConv2D_slim(
+                total_filters_num, (9, 9), corr=True, strides_down=4, padding="same_zeros",
+                use_bias=True, activation=None, name=f"analysis_conv0_{i}"))
+            layer_set.append(SignalConv2D_slim(
+                total_filters_num, (5, 5), corr=True, strides_down=2, padding="same_zeros",
+                use_bias=True, activation=None, name=f"analysis_conv1_{i}"))
+            layer_set.append(SignalConv2D_slim(
+                total_filters_num, (5, 5), corr=True, strides_down=2, padding="same_zeros",
+                use_bias=False, activation=None, name=f"analysis_conv2_{i}"))
+            self.analysis_conv_layers.append(layer_set)
             
-            with tf.variable_scope("gdn_an_1_{:1d}".format(i)):
-                tensor_gdn_1 = tfc.GDN()(tensor)
-            tensor_gdn_1 = tf.pad(tensor_gdn_1, [[0,0], [0,0], [0,0], [0,(total_filters_num - _switch)]], "CONSTANT")
-
-            # the third conv and switchable gdn layers
-            with tf.variable_scope("layer_2",reuse=(i>0)):
-                layer = tfc.SignalConv2D_slim(
-                    total_filters_num, (5, 5), corr=True, strides_down=2, padding="same_zeros",
-                    use_bias=False, activation=None)
-                tensor = layer(tensor_gdn_1, _switch, _switch)
-
-            with tf.variable_scope("gdn_an_2_{:1d}".format(i)):
-                tensor_gdn_2 = tfc.GDN()(tensor)
+            # GDN layers - 3 per switch
+            gdn_set = []
+            gdn_set.append(GDN(name=f"analysis_gdn0_{i}"))
+            gdn_set.append(GDN(name=f"analysis_gdn1_{i}"))
+            gdn_set.append(GDN(name=f"analysis_gdn2_{i}"))
+            self.analysis_gdn_layers.append(gdn_set)
+        
+        # Initialize synthesis (decoder) layers
+        self.synthesis_conv_layers = []
+        self.synthesis_gdn_layers = []
+        
+        for i in range(len(switch_list)):
+            # Convolutional layers - 3 per switch
+            layer_set = []
+            layer_set.append(SignalConv2D_slim(
+                total_filters_num, (5, 5), corr=False, strides_up=2, padding="same_zeros",
+                use_bias=True, activation=None, name=f"synthesis_conv0_{i}"))
+            layer_set.append(SignalConv2D_slim(
+                total_filters_num, (5, 5), corr=False, strides_up=2, padding="same_zeros",
+                use_bias=True, activation=None, name=f"synthesis_conv1_{i}"))
+            layer_set.append(SignalConv2D_slim(
+                3, (9, 9), corr=False, strides_up=4, padding="same_zeros",
+                use_bias=True, activation=None, name=f"synthesis_conv2_{i}"))
+            self.synthesis_conv_layers.append(layer_set)
             
-            # store the bottleneck features from different width
-            tensor_encoder.append(tensor_gdn_2)
+            # Inverse GDN layers - 3 per switch
+            gdn_set = []
+            gdn_set.append(GDN(inverse=True, name=f"synthesis_gdn0_{i}"))
+            gdn_set.append(GDN(inverse=True, name=f"synthesis_gdn1_{i}"))
+            gdn_set.append(GDN(inverse=True, name=f"synthesis_gdn2_{i}"))
+            self.synthesis_gdn_layers.append(gdn_set)
+        
+    def analysis_transform(self, tensor_in):
+        tensor_encoder = []
+        for i, _switch in enumerate(self.switch_list):
+            # --- conv0 + GDN0 ----------
+            # Conv0 outputs shape [B, H, W, _switch]
+            tensor = self.analysis_conv_layers[i][0](tensor_in, 3, _switch)
+            # pad _before_ GDN to full channels
+            tensor = tf.pad(
+                tensor,
+                [[0, 0], [0, 0], [0, 0],
+                [0, self.total_filters_num - _switch]],
+                "CONSTANT")
+            # now GDN always sees 'total_filters_num' channels
+            tensor_gdn = self.analysis_gdn_layers[i][0](
+                tensor, i, _switch)
 
+            # --- conv1 + GDN1 ----------
+            tensor = self.analysis_conv_layers[i][1](
+                tensor_gdn, _switch, _switch)
+            tensor = tf.pad(
+                tensor,
+                [[0, 0], [0, 0], [0, 0],
+                [0, self.total_filters_num - _switch]],
+                "CONSTANT")
+            tensor_gdn = self.analysis_gdn_layers[i][1](
+                tensor, i, _switch)
+
+            # --- conv2 + GDN2 ----------
+            tensor = self.analysis_conv_layers[i][2](
+                tensor_gdn, _switch, _switch)
+            tensor = tf.pad(
+                tensor,
+                [[0, 0], [0, 0], [0, 0],
+                [0, self.total_filters_num - _switch]],
+                "CONSTANT")
+            tensor_gdn = self.analysis_gdn_layers[i][2](
+                tensor, i, _switch)
+
+            tensor_encoder.append(tensor_gdn)
         return tensor_encoder
-
-# slimmable autoencoder -- decoder
-def slimmable_synthesis_transform(tensor_encoder, switch_list, total_filters_num):
-    """Builds the slimmable synthesis transform."""
-    with tf.variable_scope("synthesis"):
-        tensor_decoder = list()
-        for i, _switch in enumerate(switch_list):
-            # the first deconv and igdn layers
-            with tf.variable_scope("gdn_sy_0_{:1d}".format(i)):
-                tensor_igdn_0 = tfc.GDN(inverse=True)(tensor_encoder[i])
-            tensor_igdn_0 = tf.pad(tensor_igdn_0, [[0,0], [0,0], [0,0], [0,(total_filters_num - _switch)]], "CONSTANT")
+    
+    def synthesis_transform(self, tensor_encoder):
+        """Builds the synthesis transform (decoder)."""
+        tensor_decoder = []
+        
+        for i, _switch in enumerate(self.switch_list):
+            # --- first pad + IGDN0 + deconv0 ----------
+            # pad up to full channels before IGDN
+            tensor = tf.pad(
+                tensor_encoder[i],
+                [[0, 0], [0, 0], [0, 0],
+                 [0, self.total_filters_num - _switch]],
+                "CONSTANT")
+            tensor_igdn = self.synthesis_gdn_layers[i][0](
+                tensor, i, _switch)
+            tensor = self.synthesis_conv_layers[i][0](
+                tensor_igdn, _switch, _switch)
             
-            with tf.variable_scope("layer_0",reuse=(i>0)):
-                layer = tfc.SignalConv2D_slim(
-                    total_filters_num, (5, 5), corr=False, strides_up=2, padding="same_zeros",
-                    use_bias=True, activation=None)
-                tensor = layer(tensor_igdn_0, _switch, _switch)
+            # --- second pad + IGDN1 + deconv1 ----------
+            tensor = tf.pad(
+                tensor,
+                [[0, 0], [0, 0], [0, 0],
+                 [0, self.total_filters_num - _switch]],
+                "CONSTANT")
+            tensor_igdn = self.synthesis_gdn_layers[i][1](
+                tensor, i, _switch)
+            tensor = self.synthesis_conv_layers[i][1](
+                tensor_igdn, _switch, _switch)
             
-            # the second deconv and igdn layers
-            with tf.variable_scope("gdn_sy_1_{:1d}".format(i)):
-                tensor_igdn_1 = tfc.GDN(inverse=True)(tensor)
-            tensor_igdn_1 = tf.pad(tensor_igdn_1, [[0,0], [0,0], [0,0], [0,(total_filters_num - _switch)]], "CONSTANT")
+            # --- third pad + IGDN2 + deconv2 ----------
+            tensor = tf.pad(
+                tensor,
+                [[0, 0], [0, 0], [0, 0],
+                 [0, self.total_filters_num - _switch]],
+                "CONSTANT")
+            tensor_igdn = self.synthesis_gdn_layers[i][2](
+                tensor, i, _switch)
+            tensor = self.synthesis_conv_layers[i][2](
+                tensor_igdn, _switch, 3)
             
-            with tf.variable_scope("layer_1",reuse=(i>0)):
-                layer = tfc.SignalConv2D_slim(
-                    total_filters_num, (5, 5), corr=False, strides_up=2, padding="same_zeros",
-                    use_bias=True, activation=None)
-                tensor = layer(tensor_igdn_1, _switch, _switch)
-
-            # the third deconv and igdn layers    
-            with tf.variable_scope("gdn_sy_2_{:1d}".format(i)):
-                tensor_igdn_2 = tfc.GDN(inverse=True)(tensor)
-            tensor_igdn_2 = tf.pad(tensor_igdn_2, [[0,0], [0,0], [0,0], [0,(total_filters_num - _switch)]], "CONSTANT")
-
-            with tf.variable_scope("layer_2",reuse=(i>0)):
-                layer = tfc.SignalConv2D_slim(
-                    3, (9, 9), corr=False, strides_up=4, padding="same_zeros",
-                    use_bias=True, activation=None)
-                tensor = layer(tensor_igdn_2, _switch, 3)
-
-             # store the reconstructions from different width   
             tensor_decoder.append(tensor)
+        
+        return tensor_decoder
+        
+    def call(self, inputs, training=False):
+        # Encoder
+        y = self.analysis_transform(inputs)
 
-        return tensor_decoder    
+        # Apply entropy models (quantize + likelihood)
+        y_tilde = []
+        likelihoods = []
+        for i, _switch in enumerate(self.switch_list):
+            _y_tilde, _likelihoods = self.entropy_models[i](
+                y[i]
+            )
+            y_tilde.append(_y_tilde)
+            likelihoods.append(_likelihoods)
 
-# train function
+        # Decoder
+        x_tilde = self.synthesis_transform(y_tilde)
+        return x_tilde, y, y_tilde, likelihoods
+
+
 def train(last_step, lmbdas):
     """Trains the model."""
+    
+    # Set logging level for TensorFlow 2.x
+    logger = tf.get_logger()
+    logger.setLevel('INFO')
+    
+    # Create input data pipeline
+    train_files = glob.glob(args.train_glob)
+    train_dataset = tf.data.Dataset.from_tensor_slices(train_files)
+    train_dataset = train_dataset.shuffle(buffer_size=len(train_files)).repeat()
+    train_dataset = train_dataset.map(load_image, num_parallel_calls=args.preprocess_threads)
 
-    if args.verbose:
-        tf.logging.set_verbosity(tf.logging.INFO)
+    def preprocess(x):
+        shape = tf.shape(x)[:2]
+        ps = args.patchsize
+        # if both H and W ≥ ps, do random crop, else resize to (ps,ps)
+        return tf.cond(
+            tf.reduce_all(shape >= [ps, ps]),
+            lambda: tf.image.random_crop(x, [ps, ps, 3]),
+            lambda: tf.image.resize(x, [ps, ps]),
+        )
 
-    # create input data pipeline.
-    with tf.device('/cpu:0'):
-        train_files = glob.glob(args.train_glob)
-        train_dataset = tf.data.Dataset.from_tensor_slices(train_files)
-        train_dataset = train_dataset.shuffle(buffer_size=len(train_files)).repeat()
-        train_dataset = train_dataset.map(
-            load_image, num_parallel_calls=args.preprocess_threads)
-        train_dataset = train_dataset.map(
-            lambda x: tf.random_crop(x, (args.patchsize, args.patchsize, 3)))
-        train_dataset = train_dataset.batch(args.batchsize)
-        train_dataset = train_dataset.prefetch(32)
+
+    train_dataset = train_dataset.map(
+        preprocess, num_parallel_calls=args.preprocess_threads
+    )
+
+
+    train_dataset = train_dataset.batch(args.batchsize)
+    train_dataset = train_dataset.prefetch(32)
 
     num_pixels = args.batchsize * args.patchsize ** 2
     total_filters_num = args.num_filters
 
-    # get training patch from dataset.
-    x = train_dataset.make_one_shot_iterator().get_next()
-
-    if args.train_jointly:
-        # lists to keep loss for each lambda
-        y_tilde, entropy_bottlenecks, likelihoods = list(), list(), list()
-        train_bpp, train_mse, train_loss = list(), list(), list()
-
-        # build a slimmable encoder
-        y = slimmable_analysis_transform(x, args.switch_list, total_filters_num)
-        
-        for i, _switch in enumerate(args.switch_list):  
-            entropy_bottlenecks.append(tfc.EntropyBottleneck())
-            _y_tilde, _likelihoods = entropy_bottlenecks[i](y[i], training=True)
-            y_tilde.append(_y_tilde)
-            likelihoods.append(_likelihoods)
-        
-        # build a slimmable decoder
-        x_tilde = slimmable_synthesis_transform(y_tilde, args.switch_list, total_filters_num)
-
-        for i, _switch in enumerate(args.switch_list):
-            # Total number of bits divided by number of pixels.
-            train_bpp.append(tf.reduce_sum(tf.log(likelihoods[i])) / (-np.log(2) * num_pixels))
-
-            # Mean squared error across pixels.
-            train_mse.append(tf.reduce_mean(tf.squared_difference(x, x_tilde[i])))
+    # Create model
+    model = SlimCAE(args.switch_list, total_filters_num)
+    
+    # Optimizer
+    main_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    
+    # Define train step function with proper gradient computation
+    def train_step(x):
+        with tf.GradientTape() as tape:
+            # Forward pass
+            x_tilde, y, y_tilde, likelihoods = model(x, training=True)
             
-            # Multiply by 255^2 to correct for rescaling.
-            # train_mse[i] *= 255 ** 2
-
-            # The rate-distortion cost.
-            train_loss.append(lmbdas[i] * train_mse[i] + train_bpp[i])
-
-        # total loss
-        total_train_loss = tf.add_n(train_loss)
-
-        # minimize loss and auxiliary loss, and execute update op.
-        step = tf.train.create_global_step()
-        main_optimizer = tf.train.AdamOptimizer(learning_rate=1e-4)
-        main_step = main_optimizer.minimize(total_train_loss, global_step=step)
-
-        aux_optimizers = list()
-        list_ops = [main_step]
-        for i, entropy_bottleneck in enumerate(entropy_bottlenecks):
-            aux_optimizers.append(tf.train.AdamOptimizer(learning_rate=1e-3))
-            list_ops.append(aux_optimizers[i].minimize(entropy_bottleneck.losses[0]))
-            list_ops.append(entropy_bottleneck.updates[0])
-        train_op = tf.group(list_ops)
-
-        # summaries
-        for i, _switch in enumerate(args.switch_list):
-            tf.summary.scalar("loss_%d" % i, train_loss[i])
-            tf.summary.scalar("bpp_%d" % i, train_bpp[i])
-            tf.summary.scalar("mse_%d" % i, train_mse[i]* 255 ** 2) # Rescaled
-            tf.summary.histogram("hist_y_%d" % i, y[i])
-
-        tf.summary.scalar("total_loss", total_train_loss)
- 
-        # Add step to logging
-        step = tf.train.get_global_step()
-        # Configure logging hook
-        tensors_to_log = {
-            'step': step,
-            'total_loss': total_train_loss
-        }
-        for i in range(len(args.switch_list)):
-            tensors_to_log[f'loss_{i}'] = train_loss[i]
-            tensors_to_log[f'bpp_{i}'] = train_bpp[i]
-            tensors_to_log[f'mse_{i}'] = train_mse[i] * 255 ** 2  # Match summary scale
+            # Calculate losses for each switch
+            train_loss_values = []
+            train_bpp_values = []
+            train_mse_values = []
             
-        logging_hook = tf.train.LoggingTensorHook(
-            tensors=tensors_to_log,
-            every_n_iter=10,
-            formatter=lambda d: f"Step {int(d['step'])} | Total: {d['total_loss']:.3f} | " + 
-                " | ".join([f"L{i}: {d[f'loss_{i}']:.3f}" for i in range(len(args.switch_list))])
-        )
+            for i, _switch in enumerate(args.switch_list):
+                # Calculate bits per pixel (bpp)
+                train_bpp = tf.reduce_sum(tf.math.log(likelihoods[i])) / (-np.log(2) * num_pixels)
+                train_bpp_values.append(train_bpp)
+                
+                # Calculate mean squared error
+                train_mse = tf.reduce_mean(tf.square(x - x_tilde[i]))
+                train_mse_values.append(train_mse)
+                
+                # Combined RD loss
+                train_loss = lmbdas[i] * train_mse + train_bpp
+                train_loss_values.append(train_loss)
+            
+            # Total loss
+            total_loss = tf.add_n(train_loss_values)
         
-        hooks = [
-            tf.train.StopAtStepHook(last_step=last_step),
-            tf.train.NanTensorHook(total_train_loss),
-            logging_hook,
+        # Compute gradients and update model
+        variables = model.trainable_variables
+        gradients = tape.gradient(total_loss, variables)
+        # # 2) Inspect per‐variable
+        # for var, grad in zip(model.trainable_variables, gradients):
+        #     # Check if gradient exists (None means no path)
+        #     exists = grad is not None  
+        #     # Compute norm (will error if grad is None)
+        #     norm = tf.norm(grad).numpy() if exists else None
+        #     print(f"{var.name:40s} | exists={exists} | norm={norm}")
+        main_optimizer.apply_gradients(zip(gradients, variables))
         
-        ]
+        return total_loss, train_loss_values, train_bpp_values, train_mse_values, y
+    
+    # TensorBoard setup
+    log_dir = os.path.join(args.checkpoint_dir, "logs")
+    summary_writer = tf.summary.create_file_writer(log_dir)
+    
+    # Checkpoint setup
+    checkpoint = tf.train.Checkpoint(model=model, optimizer=main_optimizer)
+    manager = tf.train.CheckpointManager(
+        checkpoint, args.checkpoint_dir, max_to_keep=5)
+    
+    # Restore from latest checkpoint if available
+    latest_checkpoint = manager.latest_checkpoint
+    if latest_checkpoint:
+        checkpoint.restore(latest_checkpoint)
+        print(f"Restored from {latest_checkpoint}")
+        step = int(latest_checkpoint.split('-')[-1])
+    else:
+        step = 0
+    
+    # Training loop
+    while step < last_step:
+        for batch in train_dataset:
+            loss, train_losses, bpps, mses, y_values = train_step(batch)
+            
+            # Log progress
+            if step % 100 == 0:
+                print(f"Step: {step}, Loss: {loss.numpy():.6f}")
+                
+                with summary_writer.as_default():
+                    tf.summary.scalar("total_loss", loss, step=step)
+                    for i, _switch in enumerate(args.switch_list):
+                        tf.summary.scalar(f"loss_{i}", train_losses[i], step=step)
+                        tf.summary.scalar(f"bpp_{i}", bpps[i], step=step)
+                        tf.summary.scalar(f"mse_{i}", mses[i] * 255**2, step=step)
+                        tf.summary.histogram(f"hist_y_{i}", y_values[i], step=step)
+            
+            # Save checkpoint
+            if step % 1000 == 0:
+                save_path = manager.save(checkpoint_number=step)
+                print(f"Checkpoint saved: {save_path}")
+            
+            step += 1
+            if step >= last_step:
+                break
+                
+    # Save final model
+    save_path = manager.save(checkpoint_number=step)
+    print(f"Final checkpoint saved: {save_path}")
+    
+    return model
 
-        with tf.train.MonitoredTrainingSession(
-                hooks=hooks, checkpoint_dir=args.checkpoint_dir,
-                save_checkpoint_secs=900, save_summaries_secs=600) as sess:
-            while not sess.should_stop():
-                sess.run(step)
-                sess.run(train_op)
 
 def evaluate(last_step):
     """Evaluate the model for test dataset"""
-
-    # process all the images in input_path
-    imagesList = listdir(args.inputPath)
-
+    
+    # Create model
+    model = SlimCAE(args.switch_list, args.num_filters)
+    
+    # Restore the model from checkpoint
+    checkpoint = tf.train.Checkpoint(model=model)
+    latest_checkpoint = tf.train.latest_checkpoint(args.checkpoint_dir)
+    status = checkpoint.restore(latest_checkpoint)
+    status.expect_partial()  # Suppress warnings about optimizer variables
+    
+    # Process all images
+    imagesList = os.listdir(args.inputPath)
+    
     # Initialize metric scores
     bpp_estimate_total = [0.0] * len(args.switch_list)
     mse_total = [0.0] * len(args.switch_list)
     psnr_total = [0.0] * len(args.switch_list)
     msssim_total = [0.0] * len(args.switch_list)
     msssim_db_total = [0.0] * len(args.switch_list)
-
+    
     for image in imagesList:
-        entropy_bottlenecks = list()
-        y_hat, likelihoods, eval_bpp = list(), list(), list()
-        mse, psnr, msssim = list(), list(), list()
-      
-        x = load_image(args.inputPath + image)
+        img_path = os.path.join(args.inputPath, image)
+        x = load_image(img_path)
         x = tf.expand_dims(x, 0)
         x.set_shape([1, None, None, 3])
         
-        y = slimmable_analysis_transform(x, args.switch_list, args.num_filters)
-
+        # Forward pass through the model
+        x_tilde, _, _, likelihoods = model(x, training=False)
+        
+        # Get number of pixels
+        num_pixels = tf.cast(tf.reduce_prod(tf.shape(x)[:-1]), tf.float32)
+        
+        # Scale to 0-255 range for metrics
+        x_255 = x * 255
+        
         for i, _switch in enumerate(args.switch_list):
-            entropy_bottlenecks.append(tfc.EntropyBottleneck())
-            #string_un = entropy_bottlenecks[i].compress(y[i])
-            _y_hat, _likelihoods = entropy_bottlenecks[i](y[i], training=False)  
-            y_hat.append(_y_hat)
-            likelihoods.append(_likelihoods)
-        
-        x_hat = slimmable_synthesis_transform(y_hat, args.switch_list, args.num_filters)
-        
-        num_pixels = tf.to_float(tf.reduce_prod(tf.shape(x)[:-1]))
-
-        # Bring both images back to 0..255 range.
-        x *= 255
-        
-        for i, _switch in enumerate(args.switch_list):            
-            # Total number of bits divided by number of pixels.
-            eval_bpp.append(tf.reduce_sum(tf.log(likelihoods[i])) / (-np.log(2) * num_pixels))
-            x_rec = tf.clip_by_value(x_hat[i], 0, 1)
-            x_rec = tf.round(x_rec * 255)
-            x_rec = tf.slice(x_rec, [0, 0, 0, 0], [1,tf.shape(x)[1], tf.shape(x)[2], 3])
-
-            mse.append(tf.reduce_mean(tf.squared_difference(x, x_rec)))
-            psnr.append(tf.squeeze(tf.image.psnr(x_rec, x, 255)))
-            msssim.append(tf.squeeze(tf.image.ssim_multiscale(x_rec, x, 255)))
-
-        with tf.Session() as sess:
-            # Load the latest model checkpoint, get the evaluation results.
-            latest = tf.train.latest_checkpoint(checkpoint_dir=args.checkpoint_dir)
-            tf.train.Saver().restore(sess, save_path=latest)
-
-            eval_bpp, mse, psnr, msssim, num_pixels = sess.run(
-                [eval_bpp, mse, psnr, msssim, num_pixels])
-
-        # print RD results
-        for i, _switch in enumerate(args.switch_list):
-            print("Switch level:{:1d}".format(i))
-            print("Mean squared error: {:0.4f}".format(mse[i]))
-            print("PSNR (dB): {:0.2f}".format(psnr[i]))
-            print("Multiscale SSIM: {:0.4f}".format(msssim[i]))
-            print("Multiscale SSIM (dB): {:0.2f}".format(-10 * np.log10(1 - msssim[i])))
-            print("Information content in bpp: {:0.4f}".format(eval_bpp[i]))
-                
-            bpp_estimate_total[i] += eval_bpp[i]
-            mse_total[i] += mse[i]
-            psnr_total[i] += psnr[i]
-            msssim_total[i] += msssim[i]
-            msssim_db_total[i] += (-10 * np.log10(1 - msssim[i]))
-
-        tf.reset_default_graph()
-
-    if args.evaluation_name is not None:
-        Avg_bpp_estimate = np.array(bpp_estimate_total) / len(imagesList)
-        Avg_mse, Avg_psnr = np.array(mse_total) / len(imagesList), np.array(psnr_total) / len(imagesList)
-        Avg_msssim, Avg_msssim_db = np.array(msssim_total) / len(imagesList), np.array(msssim_db_total) / len(imagesList)
-        with open (args.evaluation_name + str(last_step) + '.txt', 'w') as f:
-            f.write('Avg_bpp_estimate: '+str(Avg_bpp_estimate)+'\n')
-            f.write('Avg_mse: '+str(Avg_mse)+'\n')
-            f.write('Avg_psnr: '+str(Avg_psnr)+'\n')
-            f.write('Avg_msssim: '+str(Avg_msssim)+'\n')
-            f.write('Avg_msssim_db: '+str(Avg_msssim_db)+'\n')
+            # Calculate bpp
+            bpp = tf.reduce_sum(tf.math.log(likelihoods[i])) / (-np.log(2) * num_pixels)
+            
+            # Prepare reconstructed image
+            x_rec = tf.clip_by_value(x_tilde[i], 0, 1)
+            x_rec_255 = tf.round(x_rec * 255)
+            
+            # Calculate metrics
+            mse = tf.reduce_mean(tf.square(x_255 - x_rec_255))
+            psnr = tf.image.psnr(x_rec_255, x_255, 255)
+            msssim = tf.image.ssim_multiscale(x_rec_255, x_255, 255)
+            msssim_db = -10 * tf.math.log(1 - msssim) / tf.math.log(10.0)
+            
+            # Accumulate metrics
+            bpp_estimate_total[i] += bpp
+            mse_total[i] += mse
+            psnr_total[i] += psnr[0]
+            msssim_total[i] += msssim[0]
+            msssim_db_total[i] += msssim_db[0]
+            
+            print(f"Image {image}, Switch {i}")
+            print(f"  BPP: {bpp:.4f}")
+            print(f"  PSNR: {psnr[0]:.2f}")
+            print(f"  MS-SSIM: {msssim[0]:.4f}")
     
-    return Avg_bpp_estimate, Avg_psnr
+    # Calculate averages
+    num_images = len(imagesList)
+    avg_bpp = [b / num_images for b in bpp_estimate_total]
+    avg_mse = [m / num_images for m in mse_total] 
+    avg_psnr = [p / num_images for p in psnr_total]
+    avg_msssim = [m / num_images for m in msssim_total]
+    avg_msssim_db = [m / num_images for m in msssim_db_total]
+    
+    # Save results if needed
+    if args.evaluation_name is not None:
+        result_file = f"{args.evaluation_name}_{last_step}.txt"
+        with open(result_file, 'w') as f:
+            f.write(f'Avg_bpp_estimate: {avg_bpp}\n')
+            f.write(f'Avg_mse: {avg_mse}\n')
+            f.write(f'Avg_psnr: {avg_psnr}\n')
+            f.write(f'Avg_msssim: {avg_msssim}\n')
+            f.write(f'Avg_msssim_db: {avg_msssim_db}\n')
+    
+    return avg_bpp, avg_psnr
+
 
 def train_loop():
-    "search the optimal RD points in a slimmable compressive autoencoder"
-    # the number of iterations 
-    last_step = args.last_step
-    # initial RD tradeoffs
-    lmbdas = args.lmbda
-    # train SlimCAE as stage 1
-    train(last_step, lmbdas)
-    tf.reset_default_graph()
-    # evaluate model with validation dataset
-    bpp, psnr = evaluate(last_step)
-
-    lambda_log = list()
-    grad_flag_log = list()
-    grad_current_log = list()
+    """Search the optimal RD points in a slimmable compressive autoencoder"""
     
-    # train SlimCAE with lambda scheduling as stage 2
-    for i in range(len(lmbdas)-1): 
+    # Initial RD tradeoffs
+    lmbdas = args.lmbda.copy()
+    
+    # Train SlimCAE as stage 1
+    model = train(args.last_step, lmbdas)
+    
+    # Evaluate the model with validation dataset
+    bpp, psnr = evaluate(args.last_step)
+    
+    # Logs for lambda scheduling
+    lambda_log = [list(lmbdas)]
+    grad_flag_log = []
+    grad_current_log = []
+    
+    # Train SlimCAE with lambda scheduling as stage 2
+    for i in range(len(lmbdas) - 1):
+        if bpp[i] == bpp[i+1]:  # Avoid division by zero
+            continue
+            
         grad_flag = (psnr[i] - psnr[i+1]) / (bpp[i] - bpp[i+1])
         factor = 1
         m = 1
+        
         while True:
-            lmbdas[(i+1):] = [0.8 * element for element in lmbdas[(i+1):]] # adjust the lambda values
-            lambda_log.append(lmbdas)
-            last_step += 20 
-            train(last_step, lmbdas) # train the model with more iterations 
-            tf.reset_default_graph()
-            bpp, psnr = evaluate(last_step)
-            tf.reset_default_graph()
+            # Create new lambda values
+            new_lmbdas = lmbdas.copy()
+            for j in range(i+1, len(new_lmbdas)):
+                new_lmbdas[j] *= 0.8
+                
+            lambda_log.append(list(new_lmbdas))
+            lmbdas = new_lmbdas  # Update lambdas
+            
+            # Train more steps
+            next_step = args.last_step + 20
+            model = train(next_step, lmbdas)
+            args.last_step = next_step
+            
+            # Evaluate again
+            bpp, psnr = evaluate(args.last_step)
+            
+            if bpp[i] == bpp[i+1]:  # Avoid division by zero
+                break
+                
             grad_current = (psnr[i] - psnr[i+1]) / (bpp[i] - bpp[i+1])
             grad_flag_log.append(grad_flag)
             grad_current_log.append(grad_current)
+            
             if grad_current > grad_flag:
                 break
             else:
@@ -366,19 +480,19 @@ def train_loop():
                     break
                 grad_flag = grad_current
                 m += 1
+    
+    # Save logs
+    save_log(os.path.join(args.checkpoint_dir, 'lmbdaslog.csv'), lambda_log)
+    save_log(os.path.join(args.checkpoint_dir, 'grad_flag_log.csv'), grad_flag_log)
+    save_log(os.path.join(args.checkpoint_dir, 'grad_current_log.csv'), grad_current_log)
 
-    # save log files during the lambda scheduling 
-    with open('lmbdaslog', 'w') as myfile:
-        wr = csv.writer(myfile, quoting=csv.QUOTE_ALL)
-        wr.writerow(lambda_log)
 
-    with open('grad_flag_log', 'w') as myfile:
-        wr = csv.writer(myfile, quoting=csv.QUOTE_ALL)
-        wr.writerow(grad_flag_log)
-
-    with open('grad_current_log', 'w') as myfile:
-        wr = csv.writer(myfile, quoting=csv.QUOTE_ALL)
-        wr.writerow(grad_current_log)
+def save_log(filename, data):
+    """Save log data to a CSV file"""
+    with open(filename, 'w', newline='') as myfile:
+        writer = csv.writer(myfile, quoting=csv.QUOTE_ALL)
+        for row in data:
+            writer.writerow(row)
 
 
 if __name__ == "__main__":
@@ -422,7 +536,7 @@ if __name__ == "__main__":
              "images.")
     parser.add_argument(
         "--switch_list", nargs="+", type=int, default=[64],
-        help="Number of filters per layer.") 
+        help="Number of filters per layer.")
     parser.add_argument(
         "--evaluation_name", type=str, default='./searchRDpoints/One',
         help="the name of evaluation results txt file.")
@@ -431,9 +545,10 @@ if __name__ == "__main__":
         help="Directory where to evaluation dataset.")
     parser.add_argument(
         "--train_jointly", action="store_true",
-        help="train all the variables together.")
+        help="Train all the variables together.")
 
     args = parser.parse_args()
+    
     if args.command == "train":
         train(args.last_step, args.lmbda)
     elif args.command == "train_lambda_schedule":
