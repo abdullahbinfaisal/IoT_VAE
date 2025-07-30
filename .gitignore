@@ -1,0 +1,9 @@
+/Datasets
+/Backup
+/NeuralCompression
+/models
+/CLIC_activations
+__pycache__
+*.pyc
+Bayesian_Optimisation.ipynb
+ILLM_KD.ipynb
