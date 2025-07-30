@@ -1,1 +1,9 @@
 ## UPDATE THIS SOME TIME - NOT TODAY HAHA
+torch
+matplotlib
+numpy
+torchvision
+torchmetrics
+fvcore
+lpips
+torchsummary
